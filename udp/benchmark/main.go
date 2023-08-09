@@ -99,7 +99,7 @@ func client() {
 					panic(err)
 				}
 
-				conn, err := net.DialUDP("udp", nil, raddr)
+				conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0}) //, raddr)
 				if err != nil {
 					panic(err)
 				}
@@ -107,6 +107,7 @@ func client() {
 				msgs := make([]ipv4.Message, *batchSize)
 				for i := 0; i < *batchSize; i++ {
 					msgs[i].Buffers = [][]byte{make([]byte, *pktSize)}
+					msgs[i].Addr = raddr
 				}
 
 				for {
@@ -115,6 +116,7 @@ func client() {
 						if err == io.ErrClosedPipe {
 							break
 						}
+						fmt.Println("write error:", err, "msg", msgs[0])
 						panic(err)
 					}
 					atomic.AddInt64(&packet, int64(n))

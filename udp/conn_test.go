@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pion/transport/v2/test"
+	"github.com/stretchr/testify/assert"
 )
 
 var errHandshakeFailed = errors.New("handshake failed")
@@ -481,4 +482,59 @@ func TestConnClose(t *testing.T) {
 
 func BenchmarkBatchConn(b *testing.B) {
 
+}
+
+func TestListenerEcho(t *testing.T) {
+	lc := ListenConfig{
+		Batch: BatchIOConfig{
+			Enable:             false,
+			ReadBatchSize:      10,
+			WriteBatchSize:     10,
+			WriteBatchInterval: 5 * time.Millisecond,
+		},
+		ForkSocket: true,
+	}
+
+	laddr := net.UDPAddr{Port: 5678}
+	listener, err := lc.Listen("udp", &laddr)
+	if err != nil {
+		panic(err)
+	}
+
+	// time.AfterFunc(*duration, func() {
+	// 	listener.Close()
+	// })
+
+	go func() {
+		buf := make([]byte, 1400)
+		conn, err := listener.Accept()
+		assert.NoError(t, err)
+		fmt.Println("connected, raddr: ", conn.RemoteAddr(), "err", err)
+		defer conn.Close()
+		for {
+			n, err := conn.Read(buf)
+			assert.NoError(t, err)
+			fmt.Println("server read: ", string(buf[:n]))
+			_, err = conn.Write(buf[:n])
+			assert.NoError(t, err)
+
+		}
+	}()
+
+	rddr := net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5678}
+	client, err := net.DialUDP("udp", nil, &rddr)
+	assert.NoError(t, err)
+	defer client.Close()
+
+	buf := make([]byte, 1400)
+	for i := 0; i < 100000; i++ {
+		_, err := client.Write([]byte("hello"))
+		assert.NoError(t, err)
+		err = client.SetReadDeadline(time.Now().Add(time.Second))
+		assert.NoError(t, err)
+		n, err := client.Read(buf)
+		assert.NoError(t, err)
+		assert.Equal(t, "hello", string(buf[:n]))
+		fmt.Println("client read: ", string(buf[:n]))
+	}
 }

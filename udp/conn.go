@@ -7,14 +7,17 @@ package udp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/pion/transport/v2/deadline"
 	"github.com/pion/transport/v2/packetio"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -43,6 +46,8 @@ type listener struct {
 	readBatchSize      int
 	writeBatchSize     int
 	writeBatchInterval time.Duration
+
+	forkSocket bool
 
 	accepting    atomic.Value // bool
 	acceptCh     chan *Conn
@@ -150,6 +155,8 @@ type ListenConfig struct {
 	AcceptFilter func([]byte) bool
 
 	Batch BatchIOConfig
+
+	ForkSocket bool
 }
 
 // Listen creates a new listener based on the ListenConfig.
@@ -162,7 +169,28 @@ func (lc *ListenConfig) Listen(network string, laddr *net.UDPAddr) (net.Listener
 		return nil, ErrInvalidBatchConfig
 	}
 
-	conn, err := net.ListenUDP(network, laddr)
+	var (
+		conn *net.UDPConn
+		err  error
+	)
+	if lc.ForkSocket {
+		cfg := net.ListenConfig{
+			Control: func(network, address string, c syscall.RawConn) error {
+				return c.Control(func(fd uintptr) {
+					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+				})
+			},
+		}
+		if pConn, err1 := cfg.ListenPacket(context.Background(), laddr.Network(), laddr.String()); err1 == nil {
+			conn = pConn.(*net.UDPConn)
+		} else {
+			err = err1
+		}
+	} else {
+		conn, err = net.ListenUDP(network, laddr)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -175,6 +203,7 @@ func (lc *ListenConfig) Listen(network string, laddr *net.UDPAddr) (net.Listener
 		acceptFilter: lc.AcceptFilter,
 		connWG:       &sync.WaitGroup{},
 		readDoneCh:   make(chan struct{}),
+		forkSocket:   lc.ForkSocket,
 	}
 
 	if lc.Batch.Enable {
@@ -182,10 +211,11 @@ func (lc *ListenConfig) Listen(network string, laddr *net.UDPAddr) (net.Listener
 		l.readBatchSize = lc.Batch.ReadBatchSize
 		l.writeBatchSize = lc.Batch.WriteBatchSize
 		l.writeBatchInterval = lc.Batch.WriteBatchInterval
+		l.batchWriteLast = time.Now()
 
 		l.batchWriteMessages = make([]ipv4.Message, l.writeBatchSize)
 		for i := range l.batchWriteMessages {
-			l.batchWriteMessages[i].Buffers = [][]byte{make([]byte, 0, sendMTU)}
+			l.batchWriteMessages[i].Buffers = [][]byte{make([]byte, sendMTU)}
 		}
 		l.pConn.SetReadBuffer(10 * 1024 * 1024)
 		l.pConn.SetWriteBuffer(10 * 1024 * 1024)
@@ -241,6 +271,7 @@ func (l *listener) readBatch() {
 			return
 		}
 		for i := 0; i < n; i++ {
+			fmt.Printf("read msg %+v, addr %+v \n", msgs[i], msgs[i].Addr)
 			l.dispatchMsg(msgs[i].Addr, msgs[i].Buffers[0][:msgs[i].N])
 		}
 	}
@@ -317,8 +348,10 @@ func (l *listener) writeTo(buf []byte, raddr net.Addr) (int, error) {
 		var txN int
 		for txN < l.batchWritePos {
 			if n, err := l.batchConn.WriteBatch(l.batchWriteMessages[txN:l.batchWritePos], 0); err != nil {
+				fmt.Println("write error", err, "msgs", l.batchWriteMessages[txN:l.batchWritePos])
 				break
 			} else {
+				fmt.Print("write succc", n, " txN", txN, " l.batchWritePos", l.batchWritePos)
 				txN += n
 			}
 		}
@@ -330,6 +363,7 @@ func (l *listener) writeTo(buf []byte, raddr net.Addr) (int, error) {
 // Conn augments a connection-oriented connection over a UDP PacketConn
 type Conn struct {
 	listener *listener
+	conn     *net.UDPConn
 
 	rAddr net.Addr
 
@@ -342,17 +376,53 @@ type Conn struct {
 }
 
 func (l *listener) newConn(rAddr net.Addr) *Conn {
-	return &Conn{
+	newConn := &Conn{
 		listener:      l,
 		rAddr:         rAddr,
 		buffer:        packetio.NewBuffer(),
 		doneCh:        make(chan struct{}),
 		writeDeadline: deadline.New(),
 	}
+
+	if l.forkSocket {
+		cfg := net.ListenConfig{
+			Control: func(network, address string, c syscall.RawConn) error {
+				return c.Control(func(fd uintptr) {
+					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+				})
+			},
+		}
+		laddr := l.pConn.LocalAddr()
+		if pConn, err1 := cfg.ListenPacket(context.Background(), laddr.Network(), laddr.String()); err1 == nil {
+			newConn.conn = pConn.(*net.UDPConn)
+			sc, err := newConn.conn.SyscallConn()
+			if err == nil {
+				if err = sc.Control(func(fd uintptr) {
+					sa := syscall.SockaddrInet4{
+						Port: rAddr.(*net.UDPAddr).Port,
+					}
+					copy(sa.Addr[:], rAddr.(*net.UDPAddr).IP.To4())
+					if err = syscall.Connect(int(fd), &sa); err != nil {
+						fmt.Println("connect error", err, "addr", sa)
+					} else {
+						fmt.Println("connect succ", "addr", rAddr)
+					}
+				}); err != nil {
+					fmt.Println("control error", err, "addr", rAddr)
+					pConn.Close()
+				}
+			}
+		}
+	}
+	return newConn
 }
 
 // Read reads from c into p
 func (c *Conn) Read(p []byte) (int, error) {
+	if c.conn != nil {
+		return c.conn.Read(p)
+	}
 	return c.buffer.Read(p)
 }
 
@@ -363,7 +433,11 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 		return 0, context.DeadlineExceeded
 	default:
 	}
-	return c.listener.writeTo(p, c.rAddr)
+	if c.conn != nil {
+		return c.conn.Write(p)
+	} else {
+		return c.listener.writeTo(p, c.rAddr)
+	}
 }
 
 // Close closes the conn and releases any Read calls
