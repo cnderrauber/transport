@@ -478,3 +478,7 @@ func TestConnClose(t *testing.T) {
 		}
 	})
 }
+
+func BenchmarkBatchConn(b *testing.B) {
+
+}
