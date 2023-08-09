@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +21,7 @@ var (
 	connectHost   = flag.String("c", "localhost:9091", "connect host")
 	duration      = flag.Duration("d", 1*time.Minute, "duration")
 	pktSize       = flag.Int("ps", 1400, "packet size")
+	concurrency   = flag.Int("cc", 1, "concurrency")
 
 	packet int64
 	bytes  int64
@@ -67,7 +69,7 @@ func server() {
 			fmt.Println("accept error:", err)
 			break
 		}
-		fmt.Println("connected, raddr: ", conn, "err", err)
+		fmt.Println("connected, raddr: ", conn.RemoteAddr(), "err", err)
 		go func(conn net.Conn) {
 			defer conn.Close()
 			for {
@@ -87,59 +89,77 @@ func server() {
 }
 
 func client() {
-	raddr, err := net.ResolveUDPAddr("udp", *connectHost)
-	if err != nil {
-		panic(err)
-	}
 
-	conn, err := net.DialUDP("udp", nil, raddr)
-	if err != nil {
-		panic(err)
-	}
-
-	time.AfterFunc(*duration, func() {
-		conn.Close()
-	})
 	go report()
 	if *batch {
-		pktConn := ipv4.NewPacketConn(conn)
-		msgs := make([]ipv4.Message, *batchSize)
-		for i := 0; i < *batchSize; i++ {
-			msgs[i].Buffers = [][]byte{make([]byte, *pktSize)}
-		}
-
-		for {
-			n, err := pktConn.WriteBatch(msgs, 0)
-			if err != nil {
-				if err == io.ErrClosedPipe {
-					break
+		for i := 0; i < *concurrency; i++ {
+			go func() {
+				raddr, err := net.ResolveUDPAddr("udp", *connectHost)
+				if err != nil {
+					panic(err)
 				}
-				panic(err)
-			}
-			atomic.AddInt64(&packet, int64(n))
-			atomic.AddInt64(&bytes, int64(n*(*pktSize)))
 
-			atomic.AddInt64(&totalPacket, int64(n))
-			atomic.AddInt64(&totalBytes, int64(n*(*pktSize)))
+				conn, err := net.DialUDP("udp", nil, raddr)
+				if err != nil {
+					panic(err)
+				}
+				pktConn := ipv4.NewPacketConn(conn)
+				msgs := make([]ipv4.Message, *batchSize)
+				for i := 0; i < *batchSize; i++ {
+					msgs[i].Buffers = [][]byte{make([]byte, *pktSize)}
+				}
+
+				for {
+					n, err := pktConn.WriteBatch(msgs, 0)
+					if err != nil {
+						if err == io.ErrClosedPipe {
+							break
+						}
+						panic(err)
+					}
+					atomic.AddInt64(&packet, int64(n))
+					atomic.AddInt64(&bytes, int64(n*(*pktSize)))
+
+					atomic.AddInt64(&totalPacket, int64(n))
+					atomic.AddInt64(&totalBytes, int64(n*(*pktSize)))
+				}
+
+			}()
 		}
 	} else {
-		buf := make([]byte, *pktSize)
-		for {
-			n, err := conn.Write(buf)
-			if err != nil {
-				if err == io.ErrClosedPipe {
-					break
+		for i := 0; i < *concurrency; i++ {
+			go func() {
+				raddr, err := net.ResolveUDPAddr("udp", *connectHost)
+				if err != nil {
+					panic(err)
 				}
-				panic(err)
-			}
 
-			atomic.AddInt64(&packet, 1)
-			atomic.AddInt64(&bytes, int64(n))
+				conn, err := net.DialUDP("udp", nil, raddr)
+				if err != nil {
+					panic(err)
+				}
+				buf := make([]byte, *pktSize)
+				for {
+					n, err := conn.Write(buf)
+					if err != nil {
+						if err == io.ErrClosedPipe {
+							break
+						}
+						panic(err)
+					}
 
-			atomic.AddInt64(&totalPacket, 1)
-			atomic.AddInt64(&totalBytes, int64(n))
+					atomic.AddInt64(&packet, 1)
+					atomic.AddInt64(&bytes, int64(n))
+
+					atomic.AddInt64(&totalPacket, 1)
+					atomic.AddInt64(&totalBytes, int64(n))
+				}
+			}()
 		}
 	}
+
+	time.Sleep(*duration)
+	os.Exit(0)
 }
 
 func report() {
