@@ -19,10 +19,10 @@ var (
 	batchInterval = flag.Duration("bi", 5*time.Millisecond, "batch interval")
 	connectHost   = flag.String("c", "localhost:9091", "connect host")
 	duration      = flag.Duration("d", 1*time.Minute, "duration")
+	pktSize       = flag.Int("ps", 1400, "packet size")
 
-	elapsedMs int64
-	packet    int64
-	bytes     int64
+	packet int64
+	bytes  int64
 
 	totalPacket int64
 	totalBytes  int64
@@ -60,7 +60,7 @@ func server() {
 
 	go report()
 
-	buf := make([]byte, 1400)
+	buf := make([]byte, *pktSize)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -105,7 +105,7 @@ func client() {
 		pktConn := ipv4.NewPacketConn(conn)
 		msgs := make([]ipv4.Message, *batchSize)
 		for i := 0; i < *batchSize; i++ {
-			msgs[i].Buffers = [][]byte{make([]byte, 1400)}
+			msgs[i].Buffers = [][]byte{make([]byte, *pktSize)}
 		}
 
 		for {
@@ -117,13 +117,13 @@ func client() {
 				panic(err)
 			}
 			atomic.AddInt64(&packet, int64(n))
-			atomic.AddInt64(&bytes, int64(n*1400))
+			atomic.AddInt64(&bytes, int64(n*(*pktSize)))
 
 			atomic.AddInt64(&totalPacket, int64(n))
-			atomic.AddInt64(&totalBytes, int64(n*1400))
+			atomic.AddInt64(&totalBytes, int64(n*(*pktSize)))
 		}
 	} else {
-		buf := make([]byte, 1400)
+		buf := make([]byte, *pktSize)
 		for {
 			n, err := conn.Write(buf)
 			if err != nil {
