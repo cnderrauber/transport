@@ -420,6 +420,9 @@ func (l *listener) newConn(rAddr net.Addr) *Conn {
 
 // Read reads from c into p
 func (c *Conn) Read(p []byte) (int, error) {
+	if c.buffer.Count() > 0 {
+		return c.buffer.Read(p)
+	}
 	if c.conn != nil {
 		return c.conn.Read(p)
 	}

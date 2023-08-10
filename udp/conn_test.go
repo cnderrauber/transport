@@ -526,15 +526,25 @@ func TestListenerEcho(t *testing.T) {
 	assert.NoError(t, err)
 	defer client.Close()
 
-	buf := make([]byte, 1400)
-	for i := 0; i < 100000; i++ {
-		_, err := client.Write([]byte("hello"))
-		assert.NoError(t, err)
-		err = client.SetReadDeadline(time.Now().Add(time.Second))
-		assert.NoError(t, err)
-		n, err := client.Read(buf)
-		assert.NoError(t, err)
-		assert.Equal(t, "hello", string(buf[:n]))
-		fmt.Println("client read: ", string(buf[:n]))
+	wgs := sync.WaitGroup{}
+	wgs.Add(3)
+
+	for i := 0; i < 3; i++ {
+		sendStr := fmt.Sprintf("hello %d", i)
+		go func() {
+			defer wgs.Done()
+			buf := make([]byte, 1400)
+			for i := 0; i < 100000; i++ {
+				_, err := client.Write([]byte(sendStr))
+				assert.NoError(t, err)
+				err = client.SetReadDeadline(time.Now().Add(time.Second))
+				assert.NoError(t, err)
+				n, err := client.Read(buf)
+				assert.NoError(t, err)
+				assert.Equal(t, sendStr, string(buf[:n]))
+				fmt.Println("client read: ", string(buf[:n]))
+			}
+		}()
 	}
+	wgs.Wait()
 }
