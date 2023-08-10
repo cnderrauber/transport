@@ -48,6 +48,7 @@ type listener struct {
 	writeBatchInterval time.Duration
 
 	forkSocket bool
+	delayForkSocketBatch bool
 
 	accepting    atomic.Value // bool
 	acceptCh     chan *Conn
@@ -157,6 +158,7 @@ type ListenConfig struct {
 	Batch BatchIOConfig
 
 	ForkSocket bool
+	DelayForkSocketBatch bool
 }
 
 // Listen creates a new listener based on the ListenConfig.
@@ -204,6 +206,7 @@ func (lc *ListenConfig) Listen(network string, laddr *net.UDPAddr) (net.Listener
 		connWG:       &sync.WaitGroup{},
 		readDoneCh:   make(chan struct{}),
 		forkSocket:   lc.ForkSocket,
+		delayForkSocketBatch : lc.DelayForkSocketBatch,
 	}
 
 	if lc.Batch.Enable {
@@ -271,7 +274,6 @@ func (l *listener) readBatch() {
 			return
 		}
 		for i := 0; i < n; i++ {
-			fmt.Printf("read msg %+v, addr %+v \n", msgs[i], msgs[i].Addr)
 			l.dispatchMsg(msgs[i].Addr, msgs[i].Buffers[0][:msgs[i].N])
 		}
 	}
@@ -351,7 +353,7 @@ func (l *listener) writeTo(buf []byte, raddr net.Addr) (int, error) {
 				fmt.Println("write error", err, "msgs", l.batchWriteMessages[txN:l.batchWritePos])
 				break
 			} else {
-				fmt.Print("write succc", n, " txN", txN, " l.batchWritePos", l.batchWritePos)
+				fmt.Println("write succc", n, " txN", txN, " l.batchWritePos", l.batchWritePos)
 				txN += n
 			}
 		}
@@ -414,7 +416,7 @@ func (l *listener) newConn(rAddr net.Addr) *Conn {
 				}
 			}
 			if l.batchConn != nil {
-				newConn.conn = NewBatchConn(udpConn, l.writeBatchSize, l.writeBatchInterval)
+				newConn.conn = NewBatchConn(udpConn, l.writeBatchSize, l.writeBatchInterval,l.delayForkSocketBatch)
 			} else {
 				newConn.conn = udpConn
 			}

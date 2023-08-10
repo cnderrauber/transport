@@ -22,7 +22,7 @@ type BatchConn struct {
 	batchWriteInterval time.Duration
 }
 
-func NewBatchConn(conn *net.UDPConn, batchWriteSize int, batchWriteInterval time.Duration) *BatchConn {
+func NewBatchConn(conn *net.UDPConn, batchWriteSize int, batchWriteInterval time.Duration, delayBatch bool) *BatchConn {
 	bc := &BatchConn{
 		UDPConn:            conn,
 		batchWriteLast:     time.Now(),
@@ -34,9 +34,14 @@ func NewBatchConn(conn *net.UDPConn, batchWriteSize int, batchWriteInterval time
 		bc.batchWriteMessages[i].Buffers = [][]byte{make([]byte, sendMTU)}
 	}
 
-	time.AfterFunc(10*time.Second, func() {
+	if  delayBatch {
+		time.AfterFunc(10*time.Second, func() {
+			bc.batchConn = ipv4.NewPacketConn(bc.UDPConn)
+		})
+	} else {
 		bc.batchConn = ipv4.NewPacketConn(bc.UDPConn)
-	})
+	}
+
 	return bc
 }
 
