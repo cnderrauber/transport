@@ -363,7 +363,7 @@ func (l *listener) writeTo(buf []byte, raddr net.Addr) (int, error) {
 // Conn augments a connection-oriented connection over a UDP PacketConn
 type Conn struct {
 	listener *listener
-	conn     *net.UDPConn
+	conn     net.Conn //*net.UDPConn
 
 	rAddr net.Addr
 
@@ -395,8 +395,8 @@ func (l *listener) newConn(rAddr net.Addr) *Conn {
 		}
 		laddr := l.pConn.LocalAddr()
 		if pConn, err1 := cfg.ListenPacket(context.Background(), laddr.Network(), laddr.String()); err1 == nil {
-			newConn.conn = pConn.(*net.UDPConn)
-			sc, err := newConn.conn.SyscallConn()
+			udpConn := pConn.(*net.UDPConn)
+			sc, err := udpConn.SyscallConn()
 			if err == nil {
 				if err = sc.Control(func(fd uintptr) {
 					sa := syscall.SockaddrInet4{
@@ -413,8 +413,14 @@ func (l *listener) newConn(rAddr net.Addr) *Conn {
 					pConn.Close()
 				}
 			}
+			if l.batchConn != nil {
+				newConn.conn = NewBatchConn(udpConn, l.writeBatchSize, l.writeBatchInterval)
+			} else {
+				newConn.conn = udpConn
+			}
 		}
 	}
+
 	return newConn
 }
 
