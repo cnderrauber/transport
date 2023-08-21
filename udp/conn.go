@@ -7,17 +7,14 @@ package udp
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/pion/transport/v2/deadline"
 	"github.com/pion/transport/v2/packetio"
 	"golang.org/x/net/ipv4"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -35,20 +32,9 @@ var (
 
 // listener augments a connection-oriented Listener over a UDP PacketConn
 type listener struct {
-	pConn *net.UDPConn
+	pConn net.PacketConn
 
-	batchConn          *ipv4.PacketConn
-	batchWriteMutex    sync.Mutex
-	batchWriteMessages []ipv4.Message
-	batchWritePos      int
-	batchWriteLast     time.Time
-
-	readBatchSize      int
-	writeBatchSize     int
-	writeBatchInterval time.Duration
-
-	forkSocket           bool
-	delayForkSocketBatch bool
+	readBatchSize int
 
 	accepting    atomic.Value // bool
 	acceptCh     chan *Conn
@@ -155,10 +141,15 @@ type ListenConfig struct {
 	// the incoming packet. If not set, any packet creates new conn.
 	AcceptFilter func([]byte) bool
 
-	Batch BatchIOConfig
+	// ReadBufferSize sets the size of the operating system's
+	// receive buffer associated with the listener.
+	ReadBufferSize int
 
-	ForkSocket           bool
-	DelayForkSocketBatch bool
+	// WriteBufferSize sets the size of the operating system's
+	// send buffer associated with the connection.
+	WriteBufferSize int
+
+	Batch BatchIOConfig
 }
 
 // Listen creates a new listener based on the ListenConfig.
@@ -171,57 +162,32 @@ func (lc *ListenConfig) Listen(network string, laddr *net.UDPAddr) (net.Listener
 		return nil, ErrInvalidBatchConfig
 	}
 
-	var (
-		conn *net.UDPConn
-		err  error
-	)
-	if lc.ForkSocket {
-		cfg := net.ListenConfig{
-			Control: func(network, address string, c syscall.RawConn) error {
-				return c.Control(func(fd uintptr) {
-					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-				})
-			},
-		}
-		if pConn, err1 := cfg.ListenPacket(context.Background(), laddr.Network(), laddr.String()); err1 == nil {
-			conn = pConn.(*net.UDPConn)
-		} else {
-			err = err1
-		}
-	} else {
-		conn, err = net.ListenUDP(network, laddr)
-	}
+	conn, err := net.ListenUDP(network, laddr)
 
 	if err != nil {
 		return nil, err
 	}
 
+	if lc.ReadBufferSize > 0 {
+		conn.SetReadBuffer(lc.ReadBufferSize)
+	}
+	if lc.WriteBufferSize > 0 {
+		conn.SetWriteBuffer(lc.WriteBufferSize)
+	}
+
 	l := &listener{
-		pConn:                conn,
-		acceptCh:             make(chan *Conn, lc.Backlog),
-		conns:                make(map[string]*Conn),
-		doneCh:               make(chan struct{}),
-		acceptFilter:         lc.AcceptFilter,
-		connWG:               &sync.WaitGroup{},
-		readDoneCh:           make(chan struct{}),
-		forkSocket:           lc.ForkSocket,
-		delayForkSocketBatch: lc.DelayForkSocketBatch,
+		pConn:        conn,
+		acceptCh:     make(chan *Conn, lc.Backlog),
+		conns:        make(map[string]*Conn),
+		doneCh:       make(chan struct{}),
+		acceptFilter: lc.AcceptFilter,
+		connWG:       &sync.WaitGroup{},
+		readDoneCh:   make(chan struct{}),
 	}
 
 	if lc.Batch.Enable {
-		l.batchConn = ipv4.NewPacketConn(conn)
+		l.pConn = NewBatchConn(conn, lc.Batch.WriteBatchSize, lc.Batch.WriteBatchInterval)
 		l.readBatchSize = lc.Batch.ReadBatchSize
-		l.writeBatchSize = lc.Batch.WriteBatchSize
-		l.writeBatchInterval = lc.Batch.WriteBatchInterval
-		l.batchWriteLast = time.Now()
-
-		l.batchWriteMessages = make([]ipv4.Message, l.writeBatchSize)
-		for i := range l.batchWriteMessages {
-			l.batchWriteMessages[i].Buffers = [][]byte{make([]byte, sendMTU)}
-		}
-		l.pConn.SetReadBuffer(10 * 1024 * 1024)
-		l.pConn.SetWriteBuffer(10 * 1024 * 1024)
 	}
 
 	l.accepting.Store(true)
@@ -253,14 +219,14 @@ func (l *listener) readLoop() {
 	defer l.readWG.Done()
 	defer close(l.readDoneCh)
 
-	if l.batchConn != nil {
-		l.readBatch()
+	if br, ok := l.pConn.(batchReader); ok {
+		l.readBatch(br)
 	} else {
 		l.read()
 	}
 }
 
-func (l *listener) readBatch() {
+func (l *listener) readBatch(br batchReader) {
 	msgs := make([]ipv4.Message, l.readBatchSize)
 	for i := range msgs {
 		msg := &msgs[i]
@@ -268,7 +234,7 @@ func (l *listener) readBatch() {
 		msg.OOB = make([]byte, 40)
 	}
 	for {
-		n, err := l.batchConn.ReadBatch(msgs, 0)
+		n, err := br.ReadBatch(msgs, 0)
 		if err != nil {
 			l.errRead.Store(err)
 			return
@@ -325,46 +291,9 @@ func (l *listener) getConn(raddr net.Addr, buf []byte) (*Conn, bool, error) {
 	return conn, true, nil
 }
 
-func (l *listener) writeTo(buf []byte, raddr net.Addr) (int, error) {
-	if l.batchConn == nil {
-		return l.pConn.WriteTo(buf, raddr)
-	}
-
-	l.batchWriteMutex.Lock()
-	defer l.batchWriteMutex.Unlock()
-
-	msg := &l.batchWriteMessages[l.batchWritePos]
-	// reset buffers
-	msg.Buffers = msg.Buffers[:1]
-	msg.Buffers[0] = msg.Buffers[0][:cap(msg.Buffers[0])]
-
-	l.batchWritePos++
-	msg.Addr = raddr
-	if n := copy(msg.Buffers[0], buf); n < len(buf) {
-		// todo: use extra buffer to copy remaining bytes
-	} else {
-		msg.Buffers[0] = msg.Buffers[0][:n]
-	}
-
-	if l.batchWritePos == l.writeBatchSize || time.Since(l.batchWriteLast) > l.writeBatchInterval {
-		var txN int
-		for txN < l.batchWritePos {
-			if n, err := l.batchConn.WriteBatch(l.batchWriteMessages[txN:l.batchWritePos], 0); err != nil {
-				fmt.Println("write error", err, "msgs", l.batchWriteMessages[txN:l.batchWritePos])
-				break
-			} else {
-				txN += n
-			}
-		}
-		l.batchWritePos = 0
-	}
-	return len(buf), nil
-}
-
 // Conn augments a connection-oriented connection over a UDP PacketConn
 type Conn struct {
 	listener *listener
-	conn     net.Conn //*net.UDPConn
 
 	rAddr net.Addr
 
@@ -377,62 +306,17 @@ type Conn struct {
 }
 
 func (l *listener) newConn(rAddr net.Addr) *Conn {
-	newConn := &Conn{
+	return &Conn{
 		listener:      l,
 		rAddr:         rAddr,
 		buffer:        packetio.NewBuffer(),
 		doneCh:        make(chan struct{}),
 		writeDeadline: deadline.New(),
 	}
-
-	if l.forkSocket {
-		cfg := net.ListenConfig{
-			Control: func(network, address string, c syscall.RawConn) error {
-				return c.Control(func(fd uintptr) {
-					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-				})
-			},
-		}
-		laddr := l.pConn.LocalAddr()
-		if pConn, err1 := cfg.ListenPacket(context.Background(), laddr.Network(), laddr.String()); err1 == nil {
-			udpConn := pConn.(*net.UDPConn)
-			sc, err := udpConn.SyscallConn()
-			if err == nil {
-				if err = sc.Control(func(fd uintptr) {
-					sa := syscall.SockaddrInet4{
-						Port: rAddr.(*net.UDPAddr).Port,
-					}
-					copy(sa.Addr[:], rAddr.(*net.UDPAddr).IP.To4())
-					if err = syscall.Connect(int(fd), &sa); err != nil {
-						fmt.Println("connect error", err, "addr", sa)
-					} else {
-						fmt.Println("connect succ", "addr", rAddr)
-					}
-				}); err != nil {
-					fmt.Println("control error", err, "addr", rAddr)
-					pConn.Close()
-				}
-			}
-			if l.batchConn != nil {
-				newConn.conn = NewBatchConn(udpConn, l.writeBatchSize, l.writeBatchInterval, l.delayForkSocketBatch)
-			} else {
-				newConn.conn = udpConn
-			}
-		}
-	}
-
-	return newConn
 }
 
 // Read reads from c into p
 func (c *Conn) Read(p []byte) (int, error) {
-	if c.buffer.Count() > 0 {
-		return c.buffer.Read(p)
-	}
-	if c.conn != nil {
-		return c.conn.Read(p)
-	}
 	return c.buffer.Read(p)
 }
 
@@ -443,11 +327,7 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 		return 0, context.DeadlineExceeded
 	default:
 	}
-	if c.conn != nil {
-		return c.conn.Write(p)
-	} else {
-		return c.listener.writeTo(p, c.rAddr)
-	}
+	return c.listener.pConn.WriteTo(p, c.rAddr)
 }
 
 // Close closes the conn and releases any Read calls
