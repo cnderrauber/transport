@@ -219,14 +219,14 @@ func (l *listener) readLoop() {
 	defer l.readWG.Done()
 	defer close(l.readDoneCh)
 
-	if br, ok := l.pConn.(batchReader); ok {
+	if br, ok := l.pConn.(BatchReader); ok {
 		l.readBatch(br)
 	} else {
 		l.read()
 	}
 }
 
-func (l *listener) readBatch(br batchReader) {
+func (l *listener) readBatch(br BatchReader) {
 	msgs := make([]ipv4.Message, l.readBatchSize)
 	for i := range msgs {
 		msg := &msgs[i]

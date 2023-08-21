@@ -10,45 +10,33 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-// const (
-// 	writeSpeedUpdateInterval = time.Second
-// 	targetWriteInterval      = 2 * time.Millisecond
-// )
-
-type batchWriter interface {
+type BatchWriter interface {
 	WriteBatch(ms []ipv4.Message, flags int) (int, error)
 }
 
-type batchReader interface {
+type BatchReader interface {
 	ReadBatch(msg []ipv4.Message, flags int) (int, error)
 }
 
-type batchPacketConn interface {
-	batchWriter
-	batchReader
+type BatchPacketConn interface {
+	BatchWriter
+	BatchReader
 }
 
 type BatchConn struct {
 	net.PacketConn
 
-	batchConn batchPacketConn
+	batchConn BatchPacketConn
 
 	batchWriteMutex    sync.Mutex
 	batchWriteMessages []ipv4.Message
 	batchWritePos      int
 	batchWriteLast     time.Time
 
-	// readBatchSize      int
-	// todo : variable batch write size based on past average write speed (pps)
 	batchWriteSize     int
 	batchWriteInterval time.Duration
 
 	closed atomic.Bool
-
-	// adaptive batch size
-	// writeCounter         int
-	// lastWriteCounterTime time.Time
-	// currentPPS           int
 }
 
 func NewBatchConn(conn net.PacketConn, batchWriteSize int, batchWriteInterval time.Duration) *BatchConn {
@@ -77,21 +65,13 @@ func NewBatchConn(conn net.PacketConn, batchWriteSize int, batchWriteInterval ti
 			writeTicker := time.NewTicker(batchWriteInterval / 2)
 			defer writeTicker.Stop()
 
-			// speedUpdateTicker := time.NewTicker(writeSpeedUpdateInterval)
-			// defer speedUpdateTicker.Stop()
-
 			for !bc.closed.Load() {
-				select {
-				case <-writeTicker.C:
-					bc.batchWriteMutex.Lock()
-					if bc.batchWritePos > 0 && time.Since(bc.batchWriteLast) >= bc.batchWriteInterval {
-						bc.flush()
-					}
-					bc.batchWriteMutex.Unlock()
-
-					// case <-speedUpdateTicker.C:
-					// 	bc.updateWriteSpeed()
+				<-writeTicker.C
+				bc.batchWriteMutex.Lock()
+				if bc.batchWritePos > 0 && time.Since(bc.batchWriteLast) >= bc.batchWriteInterval {
+					bc.flush()
 				}
+				bc.batchWriteMutex.Unlock()
 			}
 		}()
 	}
@@ -152,34 +132,6 @@ func (c *BatchConn) flush() error {
 	c.batchWriteLast = time.Now()
 	return writeErr
 }
-
-// func (c *BatchConn) updateWriteSpeed() {
-// 	c.batchWriteMutex.Lock()
-// 	defer c.batchWriteMutex.Unlock()
-
-// 	diff := time.Since(c.lastWriteCounterTime)
-
-// 	pps := c.writeCounter * 1000 / int(diff.Milliseconds())
-// 	c.writeCounter = 0
-// 	c.lastWriteCounterTime = time.Now()
-
-// 	switch {
-// 	case c.currentPPS == 0:
-// 		c.currentPPS = pps
-// 	case pps > c.currentPPS:
-// 		c.currentPPS = c.currentPPS + (pps-c.currentPPS)/3
-// 	case pps < c.currentPPS:
-// 		c.currentPPS = c.currentPPS + (pps-c.currentPPS)/2
-// 	}
-
-// 	writeInterval := targetWriteInterval
-// 	if writeInterval< writeInterval {
-
-// 	// TODO: adjust batch size based on currentPPS
-// 	if c.currentPPS > c.batchWriteSize {
-// 	}
-
-// }
 
 func (c *BatchConn) ReadBatch(msgs []ipv4.Message, flags int) (int, error) {
 	if c.batchConn == nil {
