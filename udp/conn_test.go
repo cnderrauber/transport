@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pion/transport/v2/test"
+	"github.com/stretchr/testify/assert"
 )
 
 var errHandshakeFailed = errors.New("handshake failed")
@@ -477,4 +478,81 @@ func TestConnClose(t *testing.T) {
 			t.Errorf("Failed to close listener: %v", err)
 		}
 	})
+}
+
+func BenchmarkBatchConn(b *testing.B) {
+
+}
+
+func TestListenerEcho(t *testing.T) {
+	lc := ListenConfig{
+		Batch: BatchIOConfig{
+			Enable:             true,
+			ReadBatchSize:      10,
+			WriteBatchSize:     3,
+			WriteBatchInterval: 5 * time.Millisecond,
+		},
+	}
+
+	laddr := net.UDPAddr{Port: 5678}
+	listener, err := lc.Listen("udp", &laddr)
+	if err != nil {
+		panic(err)
+	}
+
+	// time.AfterFunc(*duration, func() {
+	// 	listener.Close()
+	// })
+
+	go func() {
+		for {
+			buf := make([]byte, 1400)
+			conn, err := listener.Accept()
+			assert.NoError(t, err)
+			fmt.Println("connected, raddr: ", conn.RemoteAddr(), "err", err)
+			go func() {
+
+				defer conn.Close()
+				for {
+					n, err := conn.Read(buf)
+					assert.NoError(t, err)
+					fmt.Println("server read: ", string(buf[:n]), ", n: ", n)
+					_, err = conn.Write(buf[:n])
+					assert.NoError(t, err)
+
+				}
+			}()
+		}
+	}()
+
+	rddr := net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5678}
+
+	wgs := sync.WaitGroup{}
+	var cc = 3
+	wgs.Add(cc)
+
+	for i := 0; i < cc; i++ {
+		sendStr := fmt.Sprintf("hello %d", i)
+		go func() {
+			defer wgs.Done()
+			buf := make([]byte, 1400)
+			client, err := net.DialUDP("udp", nil, &rddr)
+			assert.NoError(t, err)
+			client.Write([]byte(sendStr))
+			client.Write([]byte(sendStr))
+			client.Write([]byte(sendStr))
+			defer client.Close()
+			for i := 0; i < 100; i++ {
+				_, err := client.Write([]byte(sendStr))
+				assert.NoError(t, err)
+				err = client.SetReadDeadline(time.Now().Add(time.Second))
+				assert.NoError(t, err)
+				n, err := client.Read(buf)
+				assert.NoError(t, err)
+				assert.Equal(t, sendStr, string(buf[:n]), i)
+				fmt.Println("client read: ", string(buf[:n]))
+			}
+		}()
+	}
+	wgs.Wait()
 }
