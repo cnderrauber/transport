@@ -480,11 +480,7 @@ func TestConnClose(t *testing.T) {
 	})
 }
 
-func BenchmarkBatchConn(b *testing.B) {
-
-}
-
-func TestListenerEcho(t *testing.T) {
+func TestBatchIO(t *testing.T) {
 	lc := ListenConfig{
 		Batch: BatchIOConfig{
 			Enable:             true,
@@ -494,38 +490,35 @@ func TestListenerEcho(t *testing.T) {
 		},
 	}
 
-	laddr := net.UDPAddr{Port: 5678}
+	laddr := net.UDPAddr{Port: 15678}
 	listener, err := lc.Listen("udp", &laddr)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 
-	// time.AfterFunc(*duration, func() {
-	// 	listener.Close()
-	// })
-
+	acceptQc := make(chan struct{})
 	go func() {
+		defer close(acceptQc)
 		for {
 			buf := make([]byte, 1400)
 			conn, err := listener.Accept()
+			if errors.Is(err, ErrClosedListener) {
+				break
+			}
 			assert.NoError(t, err)
-			fmt.Println("connected, raddr: ", conn.RemoteAddr(), "err", err)
 			go func() {
-
 				defer conn.Close()
 				for {
 					n, err := conn.Read(buf)
 					assert.NoError(t, err)
-					fmt.Println("server read: ", string(buf[:n]), ", n: ", n)
 					_, err = conn.Write(buf[:n])
 					assert.NoError(t, err)
-
 				}
 			}()
 		}
 	}()
 
-	rddr := net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5678}
+	raddr := listener.Addr().(*net.UDPAddr)
 
 	wgs := sync.WaitGroup{}
 	var cc = 3
@@ -536,12 +529,12 @@ func TestListenerEcho(t *testing.T) {
 		go func() {
 			defer wgs.Done()
 			buf := make([]byte, 1400)
-			client, err := net.DialUDP("udp", nil, &rddr)
+			client, err := net.DialUDP("udp", nil, raddr)
 			assert.NoError(t, err)
-			client.Write([]byte(sendStr))
-			client.Write([]byte(sendStr))
-			client.Write([]byte(sendStr))
 			defer client.Close()
+			client.Write([]byte(sendStr))
+			client.Write([]byte(sendStr))
+			client.Write([]byte(sendStr))
 			for i := 0; i < 100; i++ {
 				_, err := client.Write([]byte(sendStr))
 				assert.NoError(t, err)
@@ -550,9 +543,11 @@ func TestListenerEcho(t *testing.T) {
 				n, err := client.Read(buf)
 				assert.NoError(t, err)
 				assert.Equal(t, sendStr, string(buf[:n]), i)
-				fmt.Println("client read: ", string(buf[:n]))
 			}
 		}()
 	}
 	wgs.Wait()
+
+	listener.Close()
+	<-acceptQc
 }
